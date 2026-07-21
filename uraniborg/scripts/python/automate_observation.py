@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# Copyright 2020 Uraniborg authors.
+# Copyright 2026 Uraniborg authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,10 +67,6 @@ def parse_arguments() -> argparse.Namespace:
                       "\"results\" directory can be found.")
   parser.add_argument("-D", "--debug", required=False, action="count",
                       help="If specified, debugging mode is turned on.")
-  parser.add_argument("--use-old-results-classification", required=False,
-                      action="count",
-                      help="If specified, results will be classified using "
-                           "old classification using ADB convention.")
   parser.add_argument("--pull-all-apks", required=False,
                       action="count",
                       help="If specified, the script will attempt to download "
@@ -334,47 +330,6 @@ def wait_for_results(adb_wrapper, logger):
   return adb_wrapper.logcat_find(patterns, terminate_logcat)
 
 
-def classify_dir_using_adb_format(adb_wrapper: syscall_wrapper.AdbWrapper,
-                                  source: str,
-                                  results_dir: str,
-                                  device: syscall_wrapper.DeviceInfo,
-                                  logger: logging.Logger)-> Optional[str]:
-  """Decides which directory in results/ to dump new result to.
-
-  This method is grandfathered as it was the original way of classification,
-  using ADB's information, on product name, model name, and device name.
-
-  Args:
-    adb_wrapper: An AdbWrapper instance.
-    source: the source directory (on target device) containing new results.
-    results_dir: the umbrella results/ directory.
-    device: A DeviceInfo instance containing the device to operate on.
-    logger: A logger object to log debug or error messages.
-
-  Returns:
-    A string representing the final directory (on host) where results are pulled
-    to. <code>None</code> is returned if any failure is encountered along the
-    way.
-  """
-  target_dir_parent = os.path.join(results_dir, "{}-{}-{}".format(
-      device.product_name, device.model_name, device.device_name))
-  if not os.path.exists(target_dir_parent):
-    logger.debug("{} does not exist yet. Creating...".format(target_dir_parent))
-    os.makedirs(target_dir_parent)
-
-  target_dir = ""
-  for i in range(1000):
-    target_dir = os.path.join(target_dir_parent, "{0:03d}".format(i))
-    logger.debug("Testing {} as target directory.".format(target_dir))
-    if not os.path.exists(target_dir):
-      logger.debug("{} does not exist yet! Using it!".format(target_dir))
-      break
-
-  if adb_wrapper.pull(source, target_dir):
-    return target_dir
-  return None
-
-
 def _retry_apk_extraction(adb_wrapper: syscall_wrapper.AdbWrapper,
                           retry_packages_dict: dict[str, str],
                           apks_dir: str,
@@ -635,9 +590,7 @@ def classify_dir_using_build_fingerprint(
 def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                              source: str,
                              destination: str,
-                             device: syscall_wrapper.DeviceInfo,
                              logger: logging.Logger,
-                             use_old_classification=False,
                              extract_apks=False) -> Optional[str]:
   """Extracts results (and optionally APKs) from Hubble's execution.
 
@@ -645,12 +598,7 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
     adb_wrapper: An AdbWrapper object that is used to issue ADB commands.
     source: the path to where results live (on device).
     destination: the path to where results should be copied to (on host).
-    device: A DeviceInfo object containing the device to operate on.
     logger: A logger object to log debug or error messages.
-    use_old_classification: A boolean indicating whether to revert to old
-                            classification of result, i.e. based on how ADB
-                            displays device information. This is defaulted to
-                            False.
     extract_apks: A boolean indicating whether to also extract APKs from the
                   device or not. This is defaulted to False.
 
@@ -679,14 +627,6 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
   else:
     logger.debug("{} does not exist yet. Creating...".format(results_dir))
     os.makedirs(results_dir, exist_ok=True)
-
-  if use_old_classification:
-    # Note that this method will not support pulling APKs from device.
-    return classify_dir_using_adb_format(adb_wrapper,
-                                         source,
-                                         results_dir,
-                                         device,
-                                         logger)
 
   return classify_dir_using_build_fingerprint(adb_wrapper,
                                               source,
@@ -736,6 +676,68 @@ def extract_selinux_policies(adb_wrapper: syscall_wrapper.AdbWrapper,
         logger.warning("Failed to pull %s. Continuing...", source_location)
 
 
+def ensure_android_sdk(hubble_project_dir: str, logger: logging.Logger) -> bool:
+  """Ensures that Android SDK location is set for Gradle.
+
+  Args:
+    hubble_project_dir: Path to the Hubble Android project directory.
+    logger: A logger object to log debug or error messages.
+
+  Returns:
+    True if SDK location is set and valid, False otherwise.
+  """
+  if os.environ.get("ANDROID_HOME"):
+    logger.debug("ANDROID_HOME is set to %s", os.environ.get("ANDROID_HOME"))
+    return True
+  if os.environ.get("ANDROID_SDK_ROOT"):
+    logger.debug("ANDROID_SDK_ROOT is set to %s", os.environ.get("ANDROID_SDK_ROOT"))
+    return True
+
+  local_props_path = os.path.join(hubble_project_dir, "local.properties")
+  if os.path.exists(local_props_path):
+    with open(local_props_path, "r") as f:
+      for line in f:
+        if line.startswith("sdk.dir="):
+          sdk_dir = line.split("=")[1].strip()
+          logger.debug("Found sdk.dir in local.properties: %s", sdk_dir)
+          if os.path.exists(sdk_dir):
+            return True
+          else:
+            logger.warning("sdk.dir in local.properties points to non-existent directory: %s", sdk_dir)
+
+  default_locations = []
+  if sys.platform == "darwin":
+    default_locations.append(os.path.expanduser("~/Library/Android/sdk"))
+  elif sys.platform == "linux":
+    default_locations.append(os.path.expanduser("~/Android/Sdk"))
+
+  sdk_path = None
+  for loc in default_locations:
+    if os.path.exists(loc):
+      logger.info("Auto-detected Android SDK at %s", loc)
+      sdk_path = loc
+      break
+
+  if not sdk_path:
+    logger.error("Android SDK location not found in environment or default locations.")
+    logger.error("Please set the ANDROID_HOME environment variable to point to your Android SDK installation.")
+    return False
+
+  logger.info("Writing sdk.dir to %s", local_props_path)
+  lines = []
+  if os.path.exists(local_props_path):
+    with open(local_props_path, "r") as f:
+      lines = f.read().splitlines()
+
+  lines = [l for l in lines if not l.strip().startswith("sdk.dir=")]
+  lines.append(f"sdk.dir={sdk_path}")
+
+  with open(local_props_path, "w") as f:
+    f.write("\n".join(lines) + "\n")
+
+  return True
+
+
 def main():
   args = parse_arguments()
   logger = set_up_logging(args)
@@ -748,22 +750,23 @@ def main():
     logger.info("-H flag not used. Rebuilding Hubble...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     hubble_project_dir = os.path.abspath(os.path.join(script_dir, "../../AndroidStudioProject/Hubble"))
+    if not ensure_android_sdk(hubble_project_dir, logger):
+      logger.error("Failed to (re)build Hubble APK: Android SDK not found.")
+      return
     gradlew_path = os.path.join(hubble_project_dir, "gradlew")
 
     logger.info("Running 'gradlew assemble' in %s", hubble_project_dir)
     sw = SyscallWrapper(logger)
     sw.call_returnable_command([gradlew_path, "assemble"], cwd=hubble_project_dir)
     if sw.error_occured:
-      logger.error("Failed to (re)build Hubble APK!")
-      logger.error("Command failed with exit code %d", sw.return_code)
-      logger.error("Error message:\n%s", sw.error_message)
-      logger.error("Please check for missing dependencies or other build errors.")
+      logger.error("Failed to (re)build Hubble APK: [%d] %s", sw.return_code, sw.error_message)
       return
 
     for line in sw.result_final:
       logger.debug("Gradle output: %s", line)
 
     latest_symlink_path = os.path.abspath(os.path.join(script_dir, "../../prebuilts/APK/latest"))
+    os.makedirs(os.path.dirname(latest_symlink_path), exist_ok=True)
     if os.path.exists(latest_symlink_path) or os.path.islink(latest_symlink_path):
       logger.debug("Removing old symlink: %s", latest_symlink_path)
       try:
@@ -844,14 +847,11 @@ def main():
     if not results_source:
       logger.error("Failed to obtain results from Hubble execution.")
       continue
-    use_old_classification = args.use_old_results_classification is not None
     extract_apks = args.pull_all_apks is not None
     results_dir = extract_results_and_apks(adb_wrapper,
                                            results_source,
                                            args.output,
-                                           target_device,
                                            logger,
-                                           use_old_classification,
                                            extract_apks)
 
     if not results_dir:
